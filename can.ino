@@ -1,9 +1,12 @@
+#define SOFT_SERIAL
+
 #include <SdFat.h>
 #ifdef SOFT_SERIAL
 #include <AltSoftSerial.h>
 #endif
 #include <mcp_can.h>
 #include <RTClib.h>
+#include <digitalWriteFast.h>
 
 /*
  * File size 5 MB
@@ -82,41 +85,68 @@ SDA: A4
  * DI - 11
  * CLK - 13
  */
+
+ /* Leaf
+  *  CAR H 6
+CAR L 14
+
+EV H 13
+EV L 12
+
+AV H 11
+AV L 3
+
+POWER + 16
+SWITCH + 8
+
+Chasis 4
+Ground 5
+*/
 //25ma at 3.3V
+
+
+//https://github.com/marwatk/CAN_BUS_Shield otherwise we're using https://github.com/marwatk/MCP_CAN_lib
+#define CAN_BUS_SHIELD 1
 
 #define SIZE_IRRELEVANT_8 0xff
 
 #define CAN_MSG_LOG_HEADER PSTR("C#=")
 #define DATE_LOG_HEADER PSTR("T#=")
 #define NEWLINE PSTR("\n")
+//#define BUFFER_SD_WRITES
 //#define LOG_CANS 1
 
 RTC_DS3231 rtc;
 
-MCP_CAN cans[3] = { //CS pins
-  MCP_CAN(2),
-  MCP_CAN(4),
-  MCP_CAN(6),
-};
+MCP_CAN CAR_CAN(2);
+MCP_CAN EV_CAN(4);
+MCP_CAN AV_CAN(6);
+
+#define CAR_INT 3
+#define EV_INT 5
+#define AV_INT 7
+
+#ifdef CAN_BUS_SHIELD
+#define MY_CAN_MODE MODE_LISTENONLY
+#define MY_CAN_MODE MODE_NORMAL
+#else
+#define MY_CAN_MODE MCP_LISTENONLY
+//#define MY_CAN_MODE MCP_NORMAL
+#endif //CAN_BUS_SHIELD
+
+boolean carEnabled = false;
+boolean evEnabled = false;
+boolean avEnabled = false;
 
 #define SD_CS 10
-
-char canInterupts[] = {3, 5, 7};
-bool canEnabled[] = {false,false,false};
-unsigned char canCounter = 0;
-
-#define SOAK_TEST 1
-#define NUM_CANS 3
-//#define CAN0_INT 7 //CAN INT
-//MCP_CAN CAN0(10); //CAN CS
 
 //CAN Message buffer and content
 unsigned char read;
 long unsigned int rxId;
-long unsigned int realRxId;
 unsigned char len = 0;
 unsigned char rxBuf[8];
 bool isRemoteRequest = false;
+unsigned char isExtended = false;
 
 //Stats to monitor
 unsigned char odo1;
@@ -130,16 +160,19 @@ unsigned char chargeState = 0;
 #define CHARGING_BIT 1
 #define PLUGGED_IN_BIT 2
 
-//Read buffer
+//Read/command buffer
 #define BUF_SIZE 16
 char buf[BUF_SIZE];
 
 //Message buffer
-char msgString[64];
+char msgString[128];
+
+//Time of loop start
+unsigned long loopStart = 0;
 
 //Logging settings
-//#define MAX_FILE_SIZE 10485760 //10MB
-#define MAX_FILE_SIZE 1048576 //1MB
+#define MAX_FILE_SIZE 10485760 //10MB
+//#define MAX_FILE_SIZE 1048576 //1MB
 //#define MAX_FILE_SIZE 10240 //10k
 boolean loggingEnabled = false;
 unsigned int fileNumber = 0;
@@ -153,17 +186,25 @@ SdFat sd;
 SdFile file;
 
 #define TEST_INTERVAL_MICROS 600
-boolean runTest = false;
-unsigned long lastSent = 0;
 
+unsigned long lastMessages[] = { 0, 0, 0 };
+unsigned long missed[] = { 0, 0, 0 };
 unsigned long lastReport = 0;
 unsigned long msgsReceived = 0;
 unsigned long loopCount = 0;
 unsigned long idleLoops = 0;
 unsigned long lastWriteTime = 0;
-size_t lastWriteSize = 0;
 #define REPORT_INTERVAL 3000
 
+boolean serialLog = false;
+
+void dateTime(uint16_t* date, uint16_t* time) {
+  DateTime now = rtc.now();
+  // return date using FAT_DATE macro to format fields
+  *date = FAT_DATE(now.year(), now.month(), now.day());
+  // return time using FAT_TIME macro to format fields
+  *time = FAT_TIME(now.hour(), now.minute(), now.second());
+}
 
 void setup() {
   Serial.begin(500000);
@@ -188,7 +229,7 @@ void setup() {
     log(F("Error configuring SD Card\n"));
   }
 
-  delay( 200 ); //Wait for BT to initialize
+  delay( 2000 ); //Wait for BT to initialize
   #ifdef SOFT_SERIAL
   setupBt();
   #endif
@@ -196,25 +237,32 @@ void setup() {
 }
 
 void loop() {
+  size_t timeLen;
+  loopStart = millis();
   boolean idleLoop = true;
-  if( fileBytesWritten > MAX_FILE_SIZE ) {
-    switchFile();
+  
+  while( !digitalReadFast( CAR_INT ) && carEnabled ) {
+    readCanMessage( CAR_CAN, 'C', 0 );
+    msgsReceived++;
+    idleLoop = false;
+  }
+  while( !digitalReadFast( EV_INT ) && evEnabled ) {
+    readCanMessage( EV_CAN, 'E', 1 );
+    msgsReceived++;
+    idleLoop = false;
+  }
+  while( !digitalReadFast( AV_INT ) && avEnabled ) {
+    readCanMessage( AV_CAN, 'A', 2 );
+    msgsReceived++;
     idleLoop = false;
   }
   
-  for( canCounter = 0; canCounter < NUM_CANS; canCounter++ ) {
-    if( !digitalRead(canInterupts[canCounter]) && canEnabled[canCounter] ) {
-      readCanMessage( cans[canCounter] );
-      msgsReceived++;
-      idleLoop = false;
-    }
-  }
-  #ifdef SOFT_SERIAL
+ #ifdef SOFT_SERIAL
   while( (read = bufferedRead( buf, BUF_SIZE, bt )) > 0 ) {
     log( F("From Bluetooth: [" ) );
     log( buf );
     log( F("]\n" ) );
-    handleBtInput( buf );
+    handleInput( buf );
     idleLoop = false;
   }
   #endif
@@ -225,26 +273,27 @@ void loop() {
     handleInput( buf );
     idleLoop = false;
   }
-  if( runTest && idleLoop) {
-    if( micros() - lastSent > TEST_INTERVAL_MICROS ) {
-      unsigned long test = micros();
-      memcpy( msgString, &test, 4 );
-      cans[0].sendMsgBuf( 128, 8, (INT8U*)msgString );
-      idleLoop = false;
-      lastSent = micros();
-    }
-  }
   if( idleLoop ) {
     idleLoops++;
   }
   loopCount++;
-  if( millis() - lastReport > REPORT_INTERVAL ) {
-    sprintf_P( msgString, PSTR("Msgs: %lu, loops: %lu  idle: %lu, lwt: %lu\n" ), msgsReceived, loopCount, idleLoops, lastWriteTime );
+  if( idleLoop && millis() - lastReport > REPORT_INTERVAL ) {
+    //sprintf_P( msgString, PSTR("Msgs: %lu, loops: %lu  idle: %lu, lwt: %lu, lrt: %lu, miss: %lu\n" ), msgsReceived, loopCount, idleLoops, lastWriteTime, lastReadTime, missed[0] + missed[1] + missed[2] );
+    sprintf_P( msgString, PSTR("Msgs: %lu, loops: %lu  idle: %lu, lwt: %lu, lrt: %lu, miss: %lu\n" ), msgsReceived, loopCount, idleLoops, lastWriteTime );
     log( msgString );
+    #ifdef SOFT_SERIAL
+      bt.print( msgString );
+    #endif
     lastReport = millis();
     idleLoops = 0;
     loopCount = 0;
     msgsReceived = 0;
+    missed[0] = 0;
+    missed[1] = 0;
+    missed[2] = 0;
+    if( serialLog ) {
+      timeMapToSerial();
+    }
   }
 }
 int sentMessageNumber = 0;
@@ -264,13 +313,11 @@ void switchFile() {
     log( F("Logging to file ") );
     log( msgString );
     log( F("\n") );
+    SdFile::dateTimeCallback(dateTime);
     if( file.open( msgString, O_CREAT | O_WRITE | O_EXCL ) ) {
       fileBytesWritten = 0;
-      DateTime now = rtc.now();
-      fileBytesWritten += file.print( DATE_LOG_HEADER );
-      fileBytesWritten += writeLongToFile( millis() );
-      fileBytesWritten += writeLongToFile( now.unixtime() );
-      fileBytesWritten += file.print( NEWLINE );
+      fileBytesWritten = timeMapToMsgString();
+      file.write( (void*)msgString, fileBytesWritten ); 
       fileOpen = true;
     }
     else {
@@ -291,22 +338,57 @@ void longToChar( char * target, unsigned long val ) {
   target[sizeof(unsigned long)] = 0;
 }
 
-
 void resetCans() {
-  for( canCounter = 0; canCounter < NUM_CANS; canCounter++ ) {
-    if( cans[canCounter].begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK ) {
-      //cans[canCounter].setMode(MCP_LISTENONLY);
-      cans[canCounter].setMode(MCP_NORMAL);
-      //cans[canCounter].enOneShotTX();
-      canEnabled[canCounter] = true;
-      sprintf_P(msgString, PSTR("CAN %d ENABLED\n"), canCounter);
-      log((char*)msgString);
-    }
-    else {
-      sprintf_P(msgString, PSTR("CAN %d FAIL\n"), canCounter);
-      log(msgString);
-    }
+  #ifdef CAN_BUS_SHIELD
+  //No one shot mode here...
+  if( CAR_CAN.begin(CAN_500KBPS, MCP_16MHz, MY_CAN_MODE) == CAN_OK ) {
+    carEnabled = true;
   }
+  if( EV_CAN.begin(CAN_500KBPS, MCP_16MHz, MY_CAN_MODE) == CAN_OK ) {
+    evEnabled = true;
+    }
+  if( AV_CAN.begin(CAN_500KBPS, MCP_16MHz, MY_CAN_MODE) == CAN_OK ) {
+    avEnabled = true;
+  }
+  #else
+  if( CAR_CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK ) {
+    CAR_CAN.setMode(MY_CAN_MODE);
+    CAR_CAN.enOneShotTX();
+    carEnabled = true;
+  }
+  if( EV_CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK ) {
+    EV_CAN.setMode(MY_CAN_MODE);
+    EV_CAN.enOneShotTX();
+    evEnabled = true;
+    }
+  if( AV_CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK ) {
+    AV_CAN.setMode(MY_CAN_MODE);
+    AV_CAN.enOneShotTX();
+    avEnabled = true;
+  }
+  #endif
+
+  if( carEnabled ) {
+    log( F("CAR can enabled\n") );
+  }
+  else {
+    log( F("CAR can failed\n" ) );
+  }
+  if( evEnabled ) {
+    log( F("EV can enabled\n") );
+  }
+  else {
+    log( F("EV can failed\n" ) );
+  }
+
+  if( avEnabled ) {
+    log( F("AV can enabled\n") );
+  }
+  else {
+    log( F("AV can failed\n" ) );
+  }
+
+
 }
 
 /* This is using an SH-HC-08 (which works on 3.3V)
@@ -316,181 +398,74 @@ void resetCans() {
  *  Changes will likely be needed with other version of BLE modules
  */
 
-#ifdef SOFT_SERIAL
-void setupBt() {
-  bt.begin(9600); //Defaults to 9600
-  sendBtAtCommand( F("AT+NAMELeafLogger") );
-  readBtCommandResponse();
-  sendBtAtCommand( F("AT+BAUD6") ); //4=9600, 5=19200, 6=38400, 7=57600, 8=115200
-  readBtCommandResponse();
-  bt.begin(38400);
-  sendBtAtCommand( F("AT") );
-  readBtCommandResponse();
-}
 
-void sendBtAtCommand( const __FlashStringHelper* command ) {
-  Serial.print( F("BT Command: ") );
-  Serial.print( command );
-  Serial.print( F("\n") );
-  bt.print( command );
-  bt.print( F("\n") );
-}
-void readBtCommandResponse() {
-  delay( 100 );
-  while( (read = bufferedRead( buf, BUF_SIZE, bt )) > 0 ) {
-    log( F("BT  Output: ") );
-    log( buf );
-    log( F("\n") );
-    delay( 10 );
-  }
-}
-
-int bufferedRead( char* buf, int maxLen, AltSoftSerial &ser ) {
-  maxLen--;
-  int i = 0;
-  while( ser.available() > 0 && i < maxLen) {
-    buf[i++] = (char)ser.read();
-    delay( 5 );
-  }
-  buf[i] = 0;
-  return i;
-}
-
-#endif //SOFT_SERIAL
-
-void handleInput( char* input ) {
-  if( !strncmp_P( input, PSTR("reset"), 5 ) ) {
-    log( F("Reset command from bluetooth\n" ) );
-  }
-  else if( !strncmp_P( input, PSTR("stop"), 4 ) ) {
-    log( F("Stop command from bluetooth\n" ) );
-    loggingEnabled = false;
-    switchFile();
-    log( F("Logging ended") );
-  }
-  else if( !strncmp_P( input, PSTR("start"), 5 ) ) {
-    log( F("Start command from bluetooth\n" ) );
-    loggingEnabled = true;
-    switchFile();
-    sprintf_P( msgString, PSTR( "Log enabled, %lu bytes written, filename %08d.log\n"), (unsigned long)fileBytesWritten, fileNumber );
-    log( msgString );
-  }
-  else if( !strncmp_P( input, PSTR("status"), 5 ) ) {
-    log( F("Status command from bluetooth\n" ) );
-    if( loggingEnabled ) {
-      sprintf_P( msgString, PSTR( "Log enabled, %lu bytes written, filename %08d.log\n"), (unsigned long)fileBytesWritten, fileNumber );
-      log( msgString );
-    }
-    else {
-      log( F("Logging disabled") );
-    }
-  }
-  else if( !strncmp_P( input, PSTR("teststart"), 9 ) ) {
-    runTest = true;
-    log( F("Test started\n") );
-  }
-  else if( !strncmp_P( input, PSTR("teststop"), 8 ) ) {
-    runTest = false;
-    log( F("Test stopped\n") );
-  }
-  else {
-    log( F("Received unknown bluetooth command" ) );
-  }
-}
-
-void log( const __FlashStringHelper* msg) {
-  Serial.print( msg );
-  if( fileOpen ) {
-    file.print( msg );
-  }
-}
-
-void log( char* b ) {
-  Serial.print( b );
-  if( fileOpen ) {
-    file.print( b );
-  }
-}
-
-
-
-void readCanMessage( MCP_CAN &can ) {
-    int i;
-    can.readMsgBuf( &rxId, &len, rxBuf );
-    //if( len != 8 && len != 4 ) {
-      //log( F("Length != 4 or 8, probably memory corruption somewhere\n") );
-      //loggingEnabled = false;
-      //switchFile();
-    //}
-    if((rxId & 0x80000000) == 0x80000000) {     // Determine if ID is standard (11 bits) or extended (29 bits)
-      realRxId = rxId & 0x1FFFFFFF;
-      #ifdef LOG_CANS
-      sprintf_P(msgString, PSTR("%lu: (%d): Extended ID: 0x%.8lX  DLC: %1d  Data:"), (unsigned long)millis(), canCounter, realRxId, len);
-      #endif
-    }
-    else {
-      realRxId = rxId;
-      #ifdef LOG_CANS
-      sprintf_P(msgString, PSTR("%lu: (%d): Standard ID: 0x%.3lX       DLC: %1d  Data:"), (unsigned long)millis(), canCounter, realRxId, len);
-      #endif
-    }
-    #ifdef LOG_CANS
+void logCanMsg( char canLabel, unsigned char canCounter ) {
+  int i;
+  sprintf_P(msgString, PSTR("%lu: (%d): Extended ID: 0x%.8lX  DLC: %1d  Data:"), (unsigned long)loopStart, canCounter, rxId, len);
+  sprintf_P(msgString, PSTR("%lu: (%d): Standard ID: 0x%.3lX       DLC: %1d  Data:"), (unsigned long)loopStart, canCounter, rxId, len);
+  log(msgString);
+  if( isRemoteRequest ) {    
+    sprintf_P(msgString, PSTR(" REMOTE REQUEST FRAME"));
     log(msgString);
-    #endif
-  
-    isRemoteRequest = (rxId & 0x40000000) == 0x40000000; // Determine if message is a remote request frame.
-
-    #ifdef LOG_CANS
-    if( isRemoteRequest ) {    
-      sprintf_P(msgString, PSTR(" REMOTE REQUEST FRAME"));
+  } else {
+    for(i = 0; i<len; i++){
+      sprintf_P(msgString, PSTR(" 0x%.2X"), rxBuf[i]);
       log(msgString);
-    } else {
-      for(i = 0; i<len; i++){
-        sprintf_P(msgString, PSTR(" 0x%.2X"), rxBuf[i]);
-        log(msgString);
+    }
+  }
+  log( F("\n") );
+  
+}
+
+void readCanMessage( MCP_CAN &can, char canLabel, unsigned char canCounter ) {
+  int i = 0;
+  #ifdef CAN_BUS_SHIELD
+    can.readMsgBufID( &rxId, &len, rxBuf ); //72-76 micros 
+    isRemoteRequest = can.isRemoteRequest();
+    isExtended = can.isExtendedFrame();
+  #else
+    can.readMsgBuf( &rxId, &isExtended, &len, rxBuf ); //152 micros
+    isRemoteRequest = can.isRequestMessage();
+  #endif
+
+  /*
+  unsigned char curMessage = rxBuf[0];
+  if( curMessage != 0 && lastMessages[canCounter] + 1 != curMessage ) {
+    missed[canCounter] += curMessage - lastMessages[canCounter] - 1;
+  }
+  lastMessages[canCounter] = curMessage;
+  */
+  
+  //Process Message
+  /*
+  switch( rxId ) {
+    case 0x292:
+      batteryVolts12V = rxBuf[3];
+      break;
+    case 0x5b3:
+      SOH = rxBuf[1];
+      ActiveFuelBars = rxBuf[6];
+      break;
+    case 0x5c5:
+      odo1 = rxBuf[1];
+      odo2 = rxBuf[2];
+      odo3 = rxBuf[3];
+      break;
+  }
+  */
+  
+  if( loggingEnabled && fileOpen ) {
+    int written = 0;
+    unsigned long start = micros();
+    size_t msgLen = canMsgToMsgString( canLabel, canCounter );
+    written = file.write( (void*)msgString, msgLen );
+    lastWriteTime = micros() - start;
+    if( serialLog ) {
+      while( i < msgLen ) {
+        Serial.write( msgString[i++] );
       }
     }
-    log( F("\n") );
-    #endif
-
-    //Process Message
-    switch( realRxId ) {
-      case 0x292:
-        batteryVolts12V = rxBuf[3];
-        break;
-      case 0x5b3:
-        SOH = rxBuf[1];
-        ActiveFuelBars = rxBuf[6];
-        break;
-      case 0x5c5:
-        odo1 = rxBuf[1];
-        odo2 = rxBuf[2];
-        odo3 = rxBuf[3];
-        break;
-    }
-    delayMicroseconds( 100 );
-  //Log message to file
-  if( loggingEnabled && fileOpen ) {
-    size_t pos = 0;
-    int written = 0;
-    pos += mconcatStr( msgString, pos, CAN_MSG_LOG_HEADER, SIZE_IRRELEVANT_8 );
-    pos += mconcatLong( msgString, pos, (unsigned long)millis() );
-    pos += mconcatChar( msgString, pos, (unsigned char)canCounter );
-    pos += mconcatLong( msgString, pos, (unsigned long)rxId );
-    pos += mconcatChar( msgString, pos, (unsigned char)len );
-    if( len > 0 ) {
-      pos += mconcatMem( msgString, pos, rxBuf, len );
-    }
-    pos += mconcatStr( msgString, pos, NEWLINE, SIZE_IRRELEVANT_8 );
-    unsigned long start = micros();
-    written = file.write( (void*)msgString, pos );
-    lastWriteTime = micros() - start;
-    delayMicroseconds( 100 );
-    //sprintf_P( msgString, PSTR( "t: %lu, s: %u, total: %lu, w: %d, l: %u\n" ), lastWriteTime, pos, fileBytesWritten, written, len );
-    //log( msgString );
-    //sprintf_P( msgString, PSTR( "m: %p, rxBuf: %p, idleLoops: %p, len: %p\n" ), (void*)msgString, (void*)rxBuf, (void*)&idleLoops, (void*)&len );
-    //log( msgString );
-    
+ 
     if( written == -1 ) {
       log( F("Write error. Closing file") );
       loggingEnabled = false;
@@ -498,16 +473,51 @@ void readCanMessage( MCP_CAN &can ) {
     }
     else {
       fileBytesWritten += written;
+      if( fileBytesWritten > MAX_FILE_SIZE ) {
+        switchFile();
+      }
     }
-    //fileBytesWritten += file.print( CAN_MSG_LOG_HEADER );
-    //fileBytesWritten += writeLongToFile( (unsigned long)millis() );
-    //fileBytesWritten += file.write( (unsigned char)canCounter );
-    //fileBytesWritten += writeLongToFile( (unsigned long)rxId );
-    //fileBytesWritten += file.write( (unsigned char)len );
-    //fileBytesWritten += file.write( rxBuf, len );
-    //fileBytesWritten += file.print( NEWLINE );
+  }
+  else if( serialLog ) {
+    size_t msgLen = canMsgToMsgString( canLabel, canCounter );
+    i = 0;
+    while( i < msgLen ) {
+      Serial.write( msgString[i++] );
+    }
   }
 
+}
+
+size_t canMsgToMsgString( char canLabel, unsigned char canCounter ) {
+  size_t pos = 0;
+  pos += mconcatStr( msgString, pos, CAN_MSG_LOG_HEADER, SIZE_IRRELEVANT_8 );
+  pos += mconcatLong( msgString, pos, loopStart );
+  pos += mconcatChar( msgString, pos, (unsigned char)canCounter );
+  pos += mconcatLong( msgString, pos, (unsigned long)rxId );
+  pos += mconcatChar( msgString, pos, (unsigned char)len );
+  if( len > 0 ) {
+    pos += mconcatMem( msgString, pos, rxBuf, len );
+  }
+  pos += mconcatStr( msgString, pos, NEWLINE, SIZE_IRRELEVANT_8 );
+  return pos;
+}
+
+
+size_t timeMapToMsgString() {
+  size_t pos = 0;
+  pos += mconcatStr( msgString, pos, DATE_LOG_HEADER, SIZE_IRRELEVANT_8 );
+  pos += mconcatLong( msgString, pos, millis() );
+  pos += mconcatLong( msgString, pos, rtc.now().unixtime() );
+  pos += mconcatStr( msgString, pos, NEWLINE, SIZE_IRRELEVANT_8 );
+  return pos;
+}
+
+void timeMapToSerial() {
+  size_t i = 0;
+  size_t len = timeMapToMsgString();
+  while( i < len ) {
+    Serial.write( msgString[i++] );
+  }
 }
 
 size_t mconcatMem( void* dest, size_t outPos, const void* src, uint8_t count ) {
@@ -582,33 +592,113 @@ size_t mconcatStr( char* dest, size_t outPos, PGM_P src, uint8_t size ) {
 
 }
 
-int bufferedSerialRead( char* buf, int maxLen ) {
-  maxLen = maxLen - 1;
-  int i = 0;
-  while( Serial.available() > 0 && i < maxLen) {
-    buf[i++] = (char)Serial.read();
-    delay( 5 );
+
+#ifdef SOFT_SERIAL
+void setupBt() {
+  bt.begin(9600); //Defaults to 9600
+  sendBtAtCommand( F("AT+NAMELeafLogger") );
+  readBtCommandResponse();
+  sendBtAtCommand( F("AT+BAUD6") ); //4=9600, 5=19200, 6=38400, 7=57600, 8=115200
+  readBtCommandResponse();
+  bt.begin(38400);
+  sendBtAtCommand( F("AT") );
+  readBtCommandResponse();
+}
+
+void sendBtAtCommand( const __FlashStringHelper* command ) {
+  Serial.print( F("BT Command: ") );
+  Serial.print( command );
+  Serial.print( F("\n") );
+  bt.print( command );
+  bt.print( F("\n") );
+}
+void readBtCommandResponse() {
+  delay( 100 );
+  while( (read = bufferedRead( buf, BUF_SIZE, bt )) > 0 ) {
+    log( F("BT  Output: ") );
+    log( buf );
+    log( F("\n") );
+    delay( 10 );
   }
-  buf[i] = 0;
-  return i;
 }
 
-#ifdef __arm__
-// should use uinstd.h to define sbrk but Due causes a conflict
-extern "C" char* sbrk(int incr);
-#else  // __ARM__
-extern char *__brkval;
-#endif  // __arm__
- 
-int freeMemory() {
-  char top;
-#ifdef __arm__
-  return &top - reinterpret_cast<char*>(sbrk(0));
-#elif defined(CORE_TEENSY) || (ARDUINO > 103 && ARDUINO != 151)
-  return &top - __brkval;
-#else  // __arm__
-  return __brkval ? &top - __brkval : &top - __malloc_heap_start;
-#endif  // __arm__
+int bufferedRead( char* buf, int maxLen, AltSoftSerial &ser ) {
+  maxLen--;
+  int len = 0;
+  int avail = 0;
+  
+  while( (avail = ser.available()) > 0 && len < maxLen) {
+    while( avail-- > 0 ) {
+      buf[len++] = (char)ser.read();
+    }
+    delayMicroseconds( 400 );
+  }
+  buf[len] = 0;
+  return len;
 }
 
+#endif //SOFT_SERIAL
 
+int bufferedSerialRead( char* buf, int maxLen ) {
+  maxLen--;
+  int len = 0;
+  int avail = 0;
+  
+  while( (avail = Serial.available()) > 0 && len < maxLen) {
+    while( avail-- > 0 ) {
+      buf[len++] = (char)Serial.read();
+    }
+    delayMicroseconds( 200 );
+  }
+  buf[len] = 0;
+  return len;
+}
+
+void handleInput( char* input ) {
+  if( !strncmp_P( input, PSTR("reset"), 5 ) ) {
+    log( F("Reset command from bluetooth\n" ) );
+  }
+  else if( !strncmp_P( input, PSTR("stop"), 4 ) ) {
+    log( F("Stop command from bluetooth\n" ) );
+    loggingEnabled = false;
+    switchFile();
+    log( F("Logging ended") );
+  }
+  else if( !strncmp_P( input, PSTR("start"), 5 ) ) {
+    log( F("Start command from bluetooth\n" ) );
+    loggingEnabled = true;
+    switchFile();
+    sprintf_P( msgString, PSTR( "Log enabled, %lu bytes written, filename %08d.log\n"), (unsigned long)fileBytesWritten, fileNumber );
+    log( msgString );
+  }
+  else if( !strncmp_P( input, PSTR("status"), 5 ) ) {
+    log( F("Status command from bluetooth\n" ) );
+    if( loggingEnabled ) {
+      sprintf_P( msgString, PSTR( "Log enabled, %lu bytes written, filename %08d.log\n"), (unsigned long)fileBytesWritten, fileNumber );
+      log( msgString );
+    }
+    else {
+      log( F("Logging disabled") );
+    }
+  }
+  else if( !strncmp_P( input, PSTR("serial"), 6 ) ) {
+    serialLog = !serialLog;
+  }
+  else {
+    log( F("Received unknown bluetooth command" ) );
+  }
+}
+
+void log( const __FlashStringHelper* msg) {
+  Serial.print( msg );
+  if( fileOpen ) {
+    file.print( msg );
+  }
+}
+
+void log( char* b ) {
+  Serial.print( b );
+  if( fileOpen ) {
+    file.print( b );
+  }
+}
