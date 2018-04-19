@@ -279,7 +279,7 @@ void loop() {
   loopCount++;
   if( idleLoop && millis() - lastReport > REPORT_INTERVAL ) {
     //sprintf_P( msgString, PSTR("Msgs: %lu, loops: %lu  idle: %lu, lwt: %lu, lrt: %lu, miss: %lu\n" ), msgsReceived, loopCount, idleLoops, lastWriteTime, lastReadTime, missed[0] + missed[1] + missed[2] );
-    sprintf_P( msgString, PSTR("Msgs: %lu, loops: %lu  idle: %lu, lwt: %lu, lrt: %lu, miss: %lu\n" ), msgsReceived, loopCount, idleLoops, lastWriteTime );
+    sprintf_P( msgString, PSTR("Msgs: %lu, loops: %lu  idle: %lu, lwt: %lu\n" ), msgsReceived, loopCount, idleLoops, lastWriteTime );
     log( msgString );
     #ifdef SOFT_SERIAL
       bt.print( msgString );
