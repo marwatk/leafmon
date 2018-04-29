@@ -87,12 +87,15 @@ SDA: A4
  */
 
  /* Leaf
-  *  CAR H 6
+Blue
+ CAR H 6
 CAR L 14
 
+Green
 EV H 13
 EV L 12
 
+Brown
 AV H 11
 AV L 3
 
@@ -127,7 +130,7 @@ MCP_CAN AV_CAN(6);
 #define AV_INT 7
 
 #ifdef CAN_BUS_SHIELD
-#define MY_CAN_MODE MODE_LISTENONLY
+//#define MY_CAN_MODE MODE_LISTENONLY
 #define MY_CAN_MODE MODE_NORMAL
 #else
 #define MY_CAN_MODE MCP_LISTENONLY
@@ -197,6 +200,7 @@ unsigned long lastWriteTime = 0;
 #define REPORT_INTERVAL 3000
 
 boolean serialLog = false;
+boolean textLog = false;
 
 void dateTime(uint16_t* date, uint16_t* time) {
   DateTime now = rtc.now();
@@ -341,27 +345,27 @@ void longToChar( char * target, unsigned long val ) {
 void resetCans() {
   #ifdef CAN_BUS_SHIELD
   //No one shot mode here...
-  if( CAR_CAN.begin(CAN_500KBPS, MCP_16MHz, MY_CAN_MODE) == CAN_OK ) {
+  if( CAR_CAN.begin(CAN_500KBPS, MCP_8MHz, MY_CAN_MODE) == CAN_OK ) {
     carEnabled = true;
   }
-  if( EV_CAN.begin(CAN_500KBPS, MCP_16MHz, MY_CAN_MODE) == CAN_OK ) {
+  if( EV_CAN.begin(CAN_500KBPS, MCP_8MHz, MY_CAN_MODE) == CAN_OK ) {
     evEnabled = true;
     }
-  if( AV_CAN.begin(CAN_500KBPS, MCP_16MHz, MY_CAN_MODE) == CAN_OK ) {
+  if( AV_CAN.begin(CAN_500KBPS, MCP_8MHz, MY_CAN_MODE) == CAN_OK ) {
     avEnabled = true;
   }
   #else
-  if( CAR_CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK ) {
+  if( CAR_CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK ) {
     CAR_CAN.setMode(MY_CAN_MODE);
     CAR_CAN.enOneShotTX();
     carEnabled = true;
   }
-  if( EV_CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK ) {
+  if( EV_CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK ) {
     EV_CAN.setMode(MY_CAN_MODE);
     EV_CAN.enOneShotTX();
     evEnabled = true;
     }
-  if( AV_CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK ) {
+  if( AV_CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK ) {
     AV_CAN.setMode(MY_CAN_MODE);
     AV_CAN.enOneShotTX();
     avEnabled = true;
@@ -399,21 +403,21 @@ void resetCans() {
  */
 
 
-void logCanMsg( char canLabel, unsigned char canCounter ) {
+void canMsgToTextSerial( char canLabel, unsigned char canCounter ) {
   int i;
-  sprintf_P(msgString, PSTR("%lu: (%d): Extended ID: 0x%.8lX  DLC: %1d  Data:"), (unsigned long)loopStart, canCounter, rxId, len);
+//  sprintf_P(msgString, PSTR("%lu: (%d): Extended ID: 0x%.8lX  DLC: %1d  Data:"), (unsigned long)loopStart, canCounter, rxId, len);
   sprintf_P(msgString, PSTR("%lu: (%d): Standard ID: 0x%.3lX       DLC: %1d  Data:"), (unsigned long)loopStart, canCounter, rxId, len);
-  log(msgString);
+  Serial.write(msgString);
   if( isRemoteRequest ) {    
     sprintf_P(msgString, PSTR(" REMOTE REQUEST FRAME"));
-    log(msgString);
+    Serial.write(msgString);
   } else {
     for(i = 0; i<len; i++){
       sprintf_P(msgString, PSTR(" 0x%.2X"), rxBuf[i]);
-      log(msgString);
+      Serial.write(msgString);
     }
   }
-  log( F("\n") );
+  Serial.print( F("\n") );
   
 }
 
@@ -484,6 +488,9 @@ void readCanMessage( MCP_CAN &can, char canLabel, unsigned char canCounter ) {
     while( i < msgLen ) {
       Serial.write( msgString[i++] );
     }
+  }
+  if( textLog ) {
+    canMsgToTextSerial( canLabel, canCounter );
   }
 
 }
@@ -683,6 +690,13 @@ void handleInput( char* input ) {
   }
   else if( !strncmp_P( input, PSTR("serial"), 6 ) ) {
     serialLog = !serialLog;
+  }
+  else if( !strncmp_P( input, PSTR("text"), 4 ) ) {
+    textLog = !textLog;
+  }
+  else if( !strncmp_P( input, PSTR("send"), 4 ) ) {
+    sprintf_P( msgString, PSTR( "AMessage" ) );
+    CAR_CAN.sendMsgBuf( 0x3d3, 0, 8, msgString, false );
   }
   else {
     log( F("Received unknown bluetooth command" ) );

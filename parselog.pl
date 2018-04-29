@@ -8,6 +8,7 @@ my $headers = {
 };
 my $headerLen = 3;
 
+my $inBetween = '';
 my $startup = 0;
 binmode( STDIN );
 
@@ -65,6 +66,16 @@ sub millisToTimeString {
     return sprintf( '%02d:%02d:%02d.%03d', $hour, $min, $sec, $millis );
 }
 
+sub addMisc {
+    my $misc = shift;
+    $inBetween .= $misc;
+    if( substr( $inBetween, -1 ) eq "\n" ) {
+        print $inBetween;
+        $inBetween = '';
+    }
+}
+    
+
 sub readHeader {
     my $header = '';
     my $bytesRead = 0;
@@ -72,6 +83,7 @@ sub readHeader {
         $bytesRead = read( STDIN, my $char, 1 );
         $header .= $char;
         if( length( $header ) > $headerLen ) {
+            addMisc( substr( $header, 0, length( $header ) - $headerLen ) );
             $header = substr( $header, $headerLen * -1 );
         }
         #print "Cur header: '$header' (BytesRead: $bytesRead)\n";
